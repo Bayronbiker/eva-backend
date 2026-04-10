@@ -1,0 +1,6 @@
+Usuario y contraseña base de datos Mongo Db:
+
+*Nombre de usuario: codeBike
+*Password: H062kCdSi9faYSlg
+
+*Otra password generada por el sistema: 0S093FABfYYXaZ6B
