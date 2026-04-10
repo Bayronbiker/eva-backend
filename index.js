@@ -4,6 +4,9 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const router = express.Router();
+
+const app = express();
 
 // --- MODELOS ---
 const User = require('./models/User');
@@ -13,7 +16,14 @@ const Remision = require('./models/Remision');
 const Cotizacion = require('./models/Cotizacion');
 const Cliente = require('./models/Cliente');
 
-const app = express();
+router.post('/register', async (req, res) => { /* tu código de registro */ });
+router.post('/login', async (req, res) => { /* tu código de login */ });
+router.get('/movimientos', async (req, res) => { /* tu código de movimientos */ });
+router.get('/resumen', async (req, res) => { /* tu código de resumen */ });
+// ... añade aquí el resto de tus rutas (clientes, facturas, etc)
+
+// Esta es la línea mágica que faltaba:
+app.use('/api', router); 
 
 // --- CONFIGURACIÓN DE CORS ---
 // Lista de orígenes permitidos (agrega aquí tu dominio de Vercel)
@@ -28,21 +38,21 @@ const ALLOWED_ORIGINS = [
 
 app.use(cors({
   origin: (origin, callback) => {
-    // Permitir peticiones sin origin (Postman, apps móviles, curl)
-    if (!origin) return callback(null, true);
-    if (ALLOWED_ORIGINS.includes(origin)) {
-      return callback(null, true);
+    if (!origin || ALLOWED_ORIGINS.includes(origin)) {
+      callback(null, true);
+    } else {
+      console.error("Bloqueado por CORS:", origin);
+      callback(new Error('No permitido por CORS'));
     }
-    console.warn(`CORS bloqueado para origen: ${origin}`);
-    return callback(new Error('No permitido por CORS'));
   },
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'ngrok-skip-browser-warning'],
   credentials: true,
 }));
 
+
 // Responder preflight OPTIONS en todas las rutas
-app.options('*', cors());
+app.options('/(.*)', cors());
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
