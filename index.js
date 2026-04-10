@@ -21,6 +21,7 @@ const ALLOWED_ORIGINS = [
   'http://localhost:5173',
   'http://localhost:3000',
   'https://eva-web-iota.vercel.app',
+  "https://eva-backend-production-54ed.up.railway.app/api"
   // Si tienes un dominio personalizado, agrégalo aquí también:
   // 'https://tudominio.com'
 ];
