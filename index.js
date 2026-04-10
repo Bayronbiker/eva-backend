@@ -51,9 +51,6 @@ app.use(cors({
 }));
 
 
-// Responder preflight OPTIONS en todas las rutas
-app.options('/(.*)', cors());
-
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
