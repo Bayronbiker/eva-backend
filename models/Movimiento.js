@@ -6,7 +6,9 @@ const MovimientoSchema = new mongoose.Schema({
     tipo: { type: String, enum: ['ingreso', 'gasto'], required: true },
     categoria: { type: String, default: 'General' },
     fecha: { type: Date, default: Date.now },
-    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true }
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    proveedor: { type: String, default: '' },
+    metodoPago: { type: String, default: '' }
 });
 
 module.exports = mongoose.model('Movimiento', MovimientoSchema);

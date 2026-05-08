@@ -90,6 +90,52 @@ app.get('/api/movimientos', verificarToken, async (req, res) => {
   } catch (err) { res.status(500).json({ message: "Error obteniendo movimientos" }); }
 });
 
+app.get('/api/movimientos/:id', verificarToken, async (req, res) => {
+  try {
+    const m = await Movimiento.findOne({ _id: req.params.id, userId: req.user.id });
+    if (!m) return res.status(404).json({ message: "Movimiento no encontrado" });
+    res.json(m);
+  } catch (err) { res.status(500).json({ message: "Error obteniendo movimiento" }); }
+});
+
+app.post('/api/movimientos', verificarToken, async (req, res) => {
+  try {
+    const { descripcion, monto, tipo, categoria, fecha, proveedor, metodoPago } = req.body;
+    if (!monto || !tipo || !categoria) return res.status(400).json({ message: "Faltan campos obligatorios" });
+    if (!['ingreso', 'gasto'].includes(tipo)) return res.status(400).json({ message: "Tipo de movimiento inválido" });
+    const movimiento = await new Movimiento({
+      descripcion: descripcion || categoria,
+      monto,
+      tipo,
+      categoria,
+      fecha: fecha ? new Date(fecha) : Date.now(),
+      userId: req.user.id,
+      proveedor: proveedor || '',
+      metodoPago: metodoPago || ''
+    }).save();
+    res.status(201).json({ message: "Movimiento creado", movimiento });
+  } catch (err) { res.status(500).json({ message: "Error creando movimiento" }); }
+});
+
+app.put('/api/movimientos/:id', verificarToken, async (req, res) => {
+  try {
+    const { descripcion, monto, tipo, categoria, fecha, proveedor, metodoPago } = req.body;
+    const m = await Movimiento.findOneAndUpdate({ _id: req.params.id, userId: req.user.id },
+      { descripcion, monto, tipo, categoria, fecha: fecha ? new Date(fecha) : Date.now(), proveedor, metodoPago },
+      { new: true });
+    if (!m) return res.status(404).json({ message: "Movimiento no encontrado" });
+    res.json({ message: "Movimiento actualizado", movimiento: m });
+  } catch (err) { res.status(500).json({ message: "Error actualizando movimiento" }); }
+});
+
+app.delete('/api/movimientos/:id', verificarToken, async (req, res) => {
+  try {
+    const m = await Movimiento.findOneAndDelete({ _id: req.params.id, userId: req.user.id });
+    if (!m) return res.status(404).json({ message: "Movimiento no encontrado" });
+    res.json({ message: "Movimiento eliminado" });
+  } catch (err) { res.status(500).json({ message: "Error eliminando movimiento" }); }
+});
+
 app.get('/api/resumen', verificarToken, async (req, res) => {
   try {
     const movimientos = await Movimiento.find({ userId: req.user.id });
