@@ -600,6 +600,63 @@ Reglas:
     }
 
     const datos = JSON.parse(jsonMatch[0]);
+
+    // ── MEJORA #2: Normalizar precios formato colombiano ──────────────────
+    const normPrecio = (val) => {
+      if (!val && val !== 0) return 0;
+      if (typeof val === 'number' && !isNaN(val)) return Math.round(Math.abs(val));
+      let s = String(val).replace(/[$COP\s%+]/gi, '').trim();
+      if (!s) return 0;
+      // Si tiene punto Y coma → el último es el decimal
+      if (s.includes('.') && s.includes(',')) {
+        if (s.lastIndexOf(',') > s.lastIndexOf('.')) {
+          s = s.replace(/\./g, '').replace(',', '.'); // "1.500,50" → "1500.50"
+        } else {
+          s = s.replace(/,/g, '');                    // "1,500.50" → "1500.50"
+        }
+      } else if (s.includes('.')) {
+        const partes = s.split('.');
+        // Separador de miles si hay más de 1 punto o parte decimal de 3 cifras
+        if (partes.length > 2 || (partes.length === 2 && partes[1].length === 3)) {
+          s = s.replace(/\./g, '');                   // "1.500.000" → "1500000"
+        }
+      } else if (s.includes(',')) {
+        const partes = s.split(',');
+        if (partes.length > 2 || (partes.length === 2 && partes[1].length === 3)) {
+          s = s.replace(/,/g, '');                    // "1,500,000" → "1500000"
+        } else {
+          s = s.replace(',', '.');                    // "1500,50"  → "1500.50"
+        }
+      }
+      const n = parseFloat(s);
+      return isNaN(n) ? 0 : Math.round(Math.abs(n));
+    };
+
+    // ── MEJORA #6: Limpiar NIT ────────────────────────────────────────────
+    const normNIT = (nit) => {
+      if (!nit) return '';
+      let s = String(nit).replace(/[^0-9-]/g, '');
+      // Quitar dígito verificador (últimos 2 chars si son -X)
+      const m = s.match(/^(\d+)-?\d$/);
+      if (m) s = m[1];
+      return s.replace(/-/g, ''); // quitar guiones restantes
+    };
+
+    // Aplicar normalización
+    datos.totalFactura = normPrecio(datos.totalFactura);
+    if (Array.isArray(datos.productos)) {
+      datos.productos = datos.productos.map(p => ({
+        ...p,
+        nombre:         p.nombre || '',
+        cantidad:       Math.max(1, Math.round(Math.abs(Number(p.cantidad) || 1))),
+        precioUnitario: normPrecio(p.precioUnitario),
+        precioTotal:    normPrecio(p.precioTotal),
+      }));
+    }
+    if (datos.proveedor) {
+      datos.proveedor.nit = normNIT(datos.proveedor.nit);
+    }
+
     res.json(datos);
   } catch (err) {
     console.error('Error analizando factura:', err);
