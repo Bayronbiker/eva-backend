@@ -11,6 +11,8 @@ const Factura = require('./models/Factura');
 const Remision = require('./models/Remision');
 const Cotizacion = require('./models/Cotizacion');
 const Cliente = require('./models/Cliente');
+const SituacionFinanciera = require('./models/SituacionFinanciera');
+const Proveedor = require('./models/Proveedor');
 
 const app = express();
 
@@ -360,6 +362,83 @@ app.delete('/api/cotizaciones/:id', verificarToken, async (req, res) => {
     if (!c) return res.status(404).json({ message: "Cotización no encontrada" });
     res.json({ message: "Cotización eliminada" });
   } catch (err) { res.status(500).json({ message: "Error eliminando cotización" }); }
+});
+
+// ─── Situación Financiera ────────────────────────────────────────────────────
+
+// GET — Obtiene (o crea vacío) el documento de situación financiera del usuario
+app.get('/api/situacion-financiera', verificarToken, async (req, res) => {
+  try {
+    let sf = await SituacionFinanciera.findOne({ userId: req.user.id });
+    if (!sf) {
+      sf = await new SituacionFinanciera({ userId: req.user.id }).save();
+    }
+    res.json(sf);
+  } catch (err) {
+    res.status(500).json({ message: 'Error obteniendo situación financiera' });
+  }
+});
+
+// PUT — Upsert completo del documento de situación financiera
+app.put('/api/situacion-financiera', verificarToken, async (req, res) => {
+  try {
+    const { efectivo, otrosActivos, activosFijos, otrosPasivos, obligacionesBancos } = req.body;
+    const sf = await SituacionFinanciera.findOneAndUpdate(
+      { userId: req.user.id },
+      { efectivo, otrosActivos, activosFijos, otrosPasivos, obligacionesBancos },
+      { new: true, upsert: true, runValidators: true }
+    );
+    res.json(sf);
+  } catch (err) {
+    res.status(500).json({ message: 'Error guardando situación financiera' });
+  }
+});
+
+// ─── Proveedores ─────────────────────────────────────────────────────────────
+
+app.get('/api/proveedores', verificarToken, async (req, res) => {
+  try {
+    const proveedores = await Proveedor.find({ userId: req.user.id }).sort({ createdAt: -1 });
+    res.json(proveedores);
+  } catch (err) {
+    res.status(500).json({ message: 'Error obteniendo proveedores' });
+  }
+});
+
+app.post('/api/proveedores', verificarToken, async (req, res) => {
+  try {
+    const { nombre, nit, telefono, email, direccion, notas } = req.body;
+    if (!nombre?.trim()) return res.status(400).json({ message: 'El nombre es requerido' });
+    const proveedor = await new Proveedor({ userId: req.user.id, nombre, nit, telefono, email, direccion, notas }).save();
+    res.status(201).json(proveedor);
+  } catch (err) {
+    res.status(500).json({ message: 'Error creando proveedor' });
+  }
+});
+
+app.put('/api/proveedores/:id', verificarToken, async (req, res) => {
+  try {
+    const { nombre, nit, telefono, email, direccion, notas } = req.body;
+    const proveedor = await Proveedor.findOneAndUpdate(
+      { _id: req.params.id, userId: req.user.id },
+      { nombre, nit, telefono, email, direccion, notas },
+      { new: true, runValidators: true }
+    );
+    if (!proveedor) return res.status(404).json({ message: 'Proveedor no encontrado' });
+    res.json(proveedor);
+  } catch (err) {
+    res.status(500).json({ message: 'Error actualizando proveedor' });
+  }
+});
+
+app.delete('/api/proveedores/:id', verificarToken, async (req, res) => {
+  try {
+    const p = await Proveedor.findOneAndDelete({ _id: req.params.id, userId: req.user.id });
+    if (!p) return res.status(404).json({ message: 'Proveedor no encontrado' });
+    res.json({ message: 'Proveedor eliminado' });
+  } catch (err) {
+    res.status(500).json({ message: 'Error eliminando proveedor' });
+  }
 });
 
 const PORT = process.env.PORT || 5000;
