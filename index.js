@@ -13,6 +13,9 @@ const Cotizacion = require('./models/Cotizacion');
 const Cliente = require('./models/Cliente');
 const SituacionFinanciera = require('./models/SituacionFinanciera');
 const Proveedor = require('./models/Proveedor');
+const Inventario = require('./models/Inventario');
+const AnthropicPkg = require('@anthropic-ai/sdk');
+const Anthropic = AnthropicPkg.default || AnthropicPkg;
 
 const app = express();
 
@@ -438,6 +441,171 @@ app.delete('/api/proveedores/:id', verificarToken, async (req, res) => {
     res.json({ message: 'Proveedor eliminado' });
   } catch (err) {
     res.status(500).json({ message: 'Error eliminando proveedor' });
+  }
+});
+
+// ─── Inventario ───────────────────────────────────────────────────────────────
+
+app.get('/api/inventario', verificarToken, async (req, res) => {
+  try {
+    const items = await Inventario.find({ userId: req.user.id }).sort({ createdAt: -1 });
+    res.json(items);
+  } catch (err) { res.status(500).json({ message: 'Error obteniendo inventario' }); }
+});
+
+app.post('/api/inventario', verificarToken, async (req, res) => {
+  try {
+    const { nombre, cantidad, precioCompra, precioVenta, categoria, descripcion, foto } = req.body;
+    if (!nombre?.trim()) return res.status(400).json({ message: 'El nombre es requerido' });
+    const item = await new Inventario({ nombre, cantidad, precioCompra, precioVenta, categoria, descripcion, foto, userId: req.user.id }).save();
+    res.status(201).json(item);
+  } catch (err) { res.status(500).json({ message: 'Error creando producto' }); }
+});
+
+app.put('/api/inventario/:id', verificarToken, async (req, res) => {
+  try {
+    const { nombre, cantidad, precioCompra, precioVenta, categoria, descripcion, foto } = req.body;
+    const item = await Inventario.findOneAndUpdate(
+      { _id: req.params.id, userId: req.user.id },
+      { nombre, cantidad, precioCompra, precioVenta, categoria, descripcion, foto },
+      { new: true, runValidators: true }
+    );
+    if (!item) return res.status(404).json({ message: 'Producto no encontrado' });
+    res.json(item);
+  } catch (err) { res.status(500).json({ message: 'Error actualizando producto' }); }
+});
+
+app.delete('/api/inventario/:id', verificarToken, async (req, res) => {
+  try {
+    const item = await Inventario.findOneAndDelete({ _id: req.params.id, userId: req.user.id });
+    if (!item) return res.status(404).json({ message: 'Producto no encontrado' });
+    res.json({ message: 'Producto eliminado' });
+  } catch (err) { res.status(500).json({ message: 'Error eliminando producto' }); }
+});
+
+// ─── Cuentas por pagar (sub-recursos del Proveedor) ───────────────────────────
+
+app.post('/api/proveedores/:id/cuentas-pagar', verificarToken, async (req, res) => {
+  try {
+    const { descripcion, montoTotal, fecha } = req.body;
+    if (!montoTotal) return res.status(400).json({ message: 'El monto es requerido' });
+    const prov = await Proveedor.findOne({ _id: req.params.id, userId: req.user.id });
+    if (!prov) return res.status(404).json({ message: 'Proveedor no encontrado' });
+    prov.cuentasPorPagar.push({ descripcion, montoTotal, fecha: fecha ? new Date(fecha) : new Date() });
+    await prov.save();
+    res.status(201).json(prov);
+  } catch (err) { res.status(500).json({ message: 'Error agregando cuenta por pagar' }); }
+});
+
+app.put('/api/proveedores/:id/cuentas-pagar/:cuentaId', verificarToken, async (req, res) => {
+  try {
+    const { estado, descripcion, montoTotal } = req.body;
+    const prov = await Proveedor.findOne({ _id: req.params.id, userId: req.user.id });
+    if (!prov) return res.status(404).json({ message: 'Proveedor no encontrado' });
+    const cuenta = prov.cuentasPorPagar.id(req.params.cuentaId);
+    if (!cuenta) return res.status(404).json({ message: 'Cuenta no encontrada' });
+    if (estado)      cuenta.estado      = estado;
+    if (descripcion) cuenta.descripcion = descripcion;
+    if (montoTotal)  cuenta.montoTotal  = montoTotal;
+    await prov.save();
+    res.json(prov);
+  } catch (err) { res.status(500).json({ message: 'Error actualizando cuenta' }); }
+});
+
+app.delete('/api/proveedores/:id/cuentas-pagar/:cuentaId', verificarToken, async (req, res) => {
+  try {
+    const prov = await Proveedor.findOne({ _id: req.params.id, userId: req.user.id });
+    if (!prov) return res.status(404).json({ message: 'Proveedor no encontrado' });
+    prov.cuentasPorPagar.pull({ _id: req.params.cuentaId });
+    await prov.save();
+    res.json(prov);
+  } catch (err) { res.status(500).json({ message: 'Error eliminando cuenta' }); }
+});
+
+// ─── Análisis de factura con IA (Claude Vision) ───────────────────────────────
+
+app.post('/api/analizar-factura', verificarToken, async (req, res) => {
+  try {
+    const { imagen } = req.body;
+    if (!imagen) return res.status(400).json({ message: 'Imagen requerida' });
+
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (!apiKey || apiKey === 'TU_API_KEY_AQUI') {
+      return res.status(503).json({ message: 'API key de Anthropic no configurada. Agrégala en el archivo .env del servidor.' });
+    }
+
+    const client = new Anthropic({ apiKey });
+
+    // Extraer base64 limpio y tipo de media
+    const base64 = imagen.includes(',') ? imagen.split(',')[1] : imagen;
+    const mediaType = imagen.includes('image/png') ? 'image/png'
+                    : imagen.includes('image/webp') ? 'image/webp'
+                    : 'image/jpeg';
+
+    const message = await client.messages.create({
+      model: 'claude-opus-4-5',
+      max_tokens: 1500,
+      messages: [{
+        role: 'user',
+        content: [
+          {
+            type: 'image',
+            source: { type: 'base64', media_type: mediaType, data: base64 }
+          },
+          {
+            type: 'text',
+            text: `Eres un asistente de contabilidad. Analiza esta imagen de factura o documento comercial y extrae toda la información posible.
+
+Responde ÚNICAMENTE con un JSON válido con esta estructura exacta (sin texto adicional antes o después):
+
+{
+  "proveedor": {
+    "nombre": "razón social o nombre de quien EMITE la factura",
+    "nit": "NIT o cédula del emisor",
+    "ciudad": "ciudad del emisor",
+    "telefono": "teléfono del emisor",
+    "email": "email del emisor",
+    "direccion": "dirección del emisor",
+    "actividadEconomica": "actividad económica o tipo de negocio"
+  },
+  "productos": [
+    {
+      "nombre": "nombre del producto o servicio",
+      "cantidad": 1,
+      "precioUnitario": 0,
+      "precioTotal": 0
+    }
+  ],
+  "totalFactura": 0,
+  "fechaFactura": "YYYY-MM-DD",
+  "numeroFactura": "número de factura si está disponible"
+}
+
+Reglas:
+- Para campos de texto no encontrados usa null
+- Para campos numéricos no encontrados usa 0
+- Los precios deben ser números sin símbolos ni separadores de miles
+- La fecha debe estar en formato YYYY-MM-DD, si no hay fecha usa null
+- Extrae TODOS los productos o servicios que aparezcan en la factura`
+          }
+        ]
+      }]
+    });
+
+    const texto = message.content[0].text.trim();
+    // Extraer JSON aunque haya texto extra alrededor
+    const jsonMatch = texto.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      return res.status(422).json({ message: 'No se pudo extraer información estructurada de la imagen. Asegúrate de que sea una factura clara.' });
+    }
+
+    const datos = JSON.parse(jsonMatch[0]);
+    res.json(datos);
+  } catch (err) {
+    console.error('Error analizando factura:', err.message);
+    if (err.status === 400) return res.status(400).json({ message: 'Imagen inválida o no legible por la IA.' });
+    if (err.status === 401) return res.status(401).json({ message: 'API key de Anthropic inválida.' });
+    res.status(500).json({ message: 'Error al analizar la factura: ' + err.message });
   }
 });
 
