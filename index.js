@@ -421,10 +421,10 @@ app.post('/api/proveedores', verificarToken, async (req, res) => {
 
 app.put('/api/proveedores/:id', verificarToken, async (req, res) => {
   try {
-    const { nombre, nit, telefono, email, direccion, notas } = req.body;
+    const { nombre, nit, ciudad, actividadEconomica, telefono, email, direccion, notas } = req.body;
     const proveedor = await Proveedor.findOneAndUpdate(
       { _id: req.params.id, userId: req.user.id },
-      { nombre, nit, telefono, email, direccion, notas },
+      { nombre, nit, ciudad, actividadEconomica, telefono, email, direccion, notas },
       { new: true, runValidators: true }
     );
     if (!proveedor) return res.status(404).json({ message: 'Proveedor no encontrado' });
@@ -543,7 +543,7 @@ app.post('/api/analizar-factura', verificarToken, async (req, res) => {
                     : 'image/jpeg';
 
     const message = await client.messages.create({
-      model: 'claude-opus-4-5',
+      model: 'claude-3-5-sonnet-20241022',
       max_tokens: 1500,
       messages: [{
         role: 'user',
@@ -602,10 +602,13 @@ Reglas:
     const datos = JSON.parse(jsonMatch[0]);
     res.json(datos);
   } catch (err) {
-    console.error('Error analizando factura:', err.message);
-    if (err.status === 400) return res.status(400).json({ message: 'Imagen inválida o no legible por la IA.' });
-    if (err.status === 401) return res.status(401).json({ message: 'API key de Anthropic inválida.' });
-    res.status(500).json({ message: 'Error al analizar la factura: ' + err.message });
+    console.error('Error analizando factura:', err);
+    const msg = err?.error?.error?.message || err?.message || 'Error desconocido';
+    if (err.status === 400) return res.status(400).json({ message: 'La IA no pudo procesar la imagen: ' + msg });
+    if (err.status === 401) return res.status(401).json({ message: 'API key de Anthropic inválida. Verifica la variable ANTHROPIC_API_KEY en Railway.' });
+    if (err.status === 404) return res.status(400).json({ message: 'Modelo de IA no encontrado: ' + msg });
+    if (err.status === 529 || err.status === 503) return res.status(503).json({ message: 'La API de Anthropic está sobrecargada. Intenta en unos segundos.' });
+    res.status(500).json({ message: 'Error al analizar la factura: ' + msg });
   }
 });
 
