@@ -669,5 +669,69 @@ Reglas:
   }
 });
 
+// ─── Chat con IA (Asistente EVA) ─────────────────────────────────────────────
+
+app.post('/api/chat', verificarToken, async (req, res) => {
+  try {
+    // 1. Tomamos el array de mensajes que envía el cliente
+    const { messages } = req.body;
+
+    // 2. Validación básica: el array debe existir y tener al menos un mensaje
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return res.status(400).json({ message: 'Se requiere un array de mensajes.' });
+    }
+
+    // 3. Verificamos que la API key de Anthropic esté configurada en el .env
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (!apiKey || apiKey === 'TU_API_KEY_AQUI') {
+      return res.status(503).json({ message: 'API key de Anthropic no configurada.' });
+    }
+
+    // 4. Creamos el cliente de Anthropic con nuestra API key
+    const client = new Anthropic({ apiKey });
+
+    // 5. Definimos el system prompt: aquí le damos personalidad e instrucciones a la IA
+    const systemPrompt = `Eres EVA, la asistente inteligente de la plataforma de gestión empresarial EVA.
+Tu misión es ayudar a pequeños y medianos empresarios colombianos a manejar mejor su negocio.
+
+Conoces a la perfección todas las funcionalidades de la plataforma EVA:
+- Facturas: crear, editar, marcar como pagadas o anuladas
+- Cotizaciones: crear y convertir en facturas con un clic
+- Remisiones: documentos de entrega de mercancía
+- Clientes: base de datos de clientes con NIT, teléfono, email
+- Proveedores: registro de proveedores con cuentas por pagar
+- Inventario: control de productos, precios de compra y venta, stock
+- Balance y situación financiera: activos, pasivos, flujo de caja
+- Análisis de facturas con IA: escanear facturas físicas automáticamente
+
+Cuando respondas:
+- Sé conciso y directo. Usa listas cuando sea útil.
+- Si el usuario pregunta cómo hacer algo en EVA, explícalo paso a paso.
+- Si pregunta sobre contabilidad o impuestos en Colombia, responde con precisión.
+- Nunca inventes datos. Si no sabes algo, dilo honestamente.
+- Responde siempre en español.`;
+
+    // 6. Llamamos a la API de Anthropic con el modelo y los mensajes
+    const response = await client.messages.create({
+      model: 'claude-haiku-4-5-20251001',  // Haiku: rápido y económico, perfecto para chat
+      max_tokens: 1024,                     // Máximo de tokens en la respuesta
+      system: systemPrompt,                 // Personalidad e instrucciones de EVA
+      messages: messages,                   // El historial completo de la conversación
+    });
+
+    // 7. Extraemos el texto de la respuesta y lo enviamos al cliente
+    const reply = response.content[0].text;
+    res.json({ reply });
+
+  } catch (err) {
+    // 8. Manejo de errores específicos de la API de Anthropic
+    console.error('Error en chat EVA:', err);
+    const msg = err?.error?.error?.message || err?.message || 'Error desconocido';
+    if (err.status === 401) return res.status(401).json({ message: 'API key de Anthropic inválida.' });
+    if (err.status === 529 || err.status === 503) return res.status(503).json({ message: 'La IA está sobrecargada. Intenta en unos segundos.' });
+    res.status(500).json({ message: 'Error en el chat: ' + msg });
+  }
+});
+
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, "0.0.0.0", () => console.log(`🚀 Servidor EVA activo en puerto ${PORT}`));
