@@ -77,7 +77,10 @@ app.post('/api/login', async (req, res) => {
     const usuario = await User.findOne({ username });
     if (!usuario) return res.status(400).json({ message: "Usuario no encontrado" });
     if (!await bcrypt.compare(password, usuario.password)) return res.status(400).json({ message: "Contraseña incorrecta" });
-    const token = jwt.sign({ id: usuario._id, username: usuario.username, role: usuario.role }, process.env.JWT_SECRET, { expiresIn: '24h' });
+    // Token de larga duración (30 días): evita que la sesión expire mientras la app
+    // está en segundo plano. Antes ('24h') el token caducaba de un día para otro y
+    // cualquier guardado posterior fallaba con 403 hasta volver a iniciar sesión.
+    const token = jwt.sign({ id: usuario._id, username: usuario.username, role: usuario.role }, process.env.JWT_SECRET, { expiresIn: '30d' });
     res.json({ message: "Login exitoso", token, user: { id: usuario._id, username: usuario.username, role: usuario.role || 'user', nombre: usuario.nombre, email: usuario.email } });
   } catch (err) { res.status(500).json({ message: "Error en login" }); }
 });
@@ -671,60 +674,463 @@ Reglas:
 
 // ─── Chat con IA (Asistente EVA) ─────────────────────────────────────────────
 
+// ─── Herramientas (tool use) que EVA puede invocar ───────────────────────────
+// Cada herramienta es una función que el modelo puede pedir ejecutar. El backend
+// la corre con seguridad (scope userId, validación) y devuelve el resultado.
+const EVA_TOOLS = [
+  {
+    name: 'consultar_movimientos',
+    description: 'Consulta los gastos e ingresos del usuario con filtros opcionales (rango de fechas, tipo, categoría). Úsala para preguntas tipo "¿cuánto gasté en combustible este mes?", "muéstrame mis últimos ingresos", "¿qué movimientos tengo de la semana pasada?".',
+    input_schema: {
+      type: 'object',
+      properties: {
+        desde: { type: 'string', description: 'Fecha de inicio en formato YYYY-MM-DD. Opcional. Si se omite, usa los últimos 30 días.' },
+        hasta: { type: 'string', description: 'Fecha final (inclusive) en formato YYYY-MM-DD. Opcional. Si se omite, usa hoy.' },
+        tipo: { type: 'string', enum: ['ingreso', 'gasto'], description: 'Filtra por tipo. Omite para ver ambos.' },
+        categoria: { type: 'string', description: 'Filtra por categoría exacta (ej. "Comida", "Combustible", "Servicios"). Opcional.' },
+        limite: { type: 'integer', description: 'Máximo de movimientos. Por defecto 20, máximo 100.' }
+      }
+    }
+  },
+  {
+    name: 'consultar_facturas',
+    description: 'Consulta las facturas del usuario, opcionalmente filtradas por estado o cliente. Úsala para "¿qué facturas tengo pendientes?", "¿quién me debe?", "facturas de María Gómez".',
+    input_schema: {
+      type: 'object',
+      properties: {
+        estado: { type: 'string', enum: ['pendiente', 'pagada', 'anulada'], description: 'Filtra por estado. Omite para ver todas.' },
+        cliente: { type: 'string', description: 'Nombre del cliente (búsqueda parcial, no distingue mayúsculas). Opcional.' },
+        limite: { type: 'integer', description: 'Máximo de facturas. Por defecto 20.' }
+      }
+    }
+  },
+  {
+    name: 'consultar_proveedor',
+    description: 'Busca un proveedor por su nombre (búsqueda parcial). Devuelve datos de contacto y NIT.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        nombre: { type: 'string', description: 'Nombre o parte del nombre del proveedor.' }
+      },
+      required: ['nombre']
+    }
+  },
+  {
+    name: 'consultar_cliente',
+    description: 'Busca un cliente por su nombre (búsqueda parcial). Devuelve datos de contacto y NIT.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        nombre: { type: 'string', description: 'Nombre o parte del nombre del cliente.' }
+      },
+      required: ['nombre']
+    }
+  },
+  {
+    name: 'resumen_periodo',
+    description: 'Devuelve el resumen financiero (total ingresos, gastos, saldo, número de movimientos) de un periodo. Úsala para "¿cómo me fue este mes?", "¿cuál fue mi mejor semana?".',
+    input_schema: {
+      type: 'object',
+      properties: {
+        desde: { type: 'string', description: 'Inicio del periodo en YYYY-MM-DD.' },
+        hasta: { type: 'string', description: 'Fin del periodo en YYYY-MM-DD.' }
+      },
+      required: ['desde', 'hasta']
+    }
+  },
+  {
+    name: 'crear_movimiento',
+    description: 'Crea un nuevo gasto o ingreso. SIEMPRE confirma con el usuario el monto, tipo y categoría ANTES de llamar esta herramienta — repite los datos en lenguaje natural y pregunta "¿lo registro?".',
+    input_schema: {
+      type: 'object',
+      properties: {
+        tipo: { type: 'string', enum: ['ingreso', 'gasto'] },
+        monto: { type: 'number', description: 'Valor en pesos colombianos (entero positivo).' },
+        categoria: { type: 'string', description: 'Categoría (ej. "Comida", "Servicios", "Venta de productos").' },
+        descripcion: { type: 'string', description: 'Descripción libre. Opcional.' },
+        fecha: { type: 'string', description: 'Fecha del movimiento en YYYY-MM-DD. Si se omite, usa hoy.' },
+        proveedor: { type: 'string', description: 'Proveedor o fuente. Opcional.' },
+        metodoPago: { type: 'string', description: 'Efectivo, Tarjeta, Transferencia, Nequi, Daviplata, Otro. Opcional.' }
+      },
+      required: ['tipo', 'monto', 'categoria']
+    }
+  },
+  {
+    name: 'crear_proveedor',
+    description: 'Registra un nuevo proveedor. SIEMPRE confirma con el usuario el nombre y NIT antes de llamar.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        nombre: { type: 'string' },
+        nit: { type: 'string', description: 'NIT o cédula sin puntos. Opcional.' },
+        telefono: { type: 'string', description: 'Opcional.' },
+        email: { type: 'string', description: 'Opcional.' },
+        direccion: { type: 'string', description: 'Opcional.' }
+      },
+      required: ['nombre']
+    }
+  },
+  {
+    name: 'marcar_factura',
+    description: 'Cambia el estado de una factura (pendiente, pagada, anulada). Recibe el número de factura o el ID interno. SIEMPRE confirma con el usuario antes de marcar como pagada o anulada.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        numero: { type: 'string', description: 'Número de factura (ej. "FAC-001") o el ID interno de MongoDB.' },
+        estado: { type: 'string', enum: ['pendiente', 'pagada', 'anulada'] }
+      },
+      required: ['numero', 'estado']
+    },
+    // Cache breakpoint en el último tool → todo el bloque de tools entra al caché.
+    cache_control: { type: 'ephemeral' }
+  },
+  {
+    name: 'top_categorias_gasto',
+    description: 'Devuelve las categorías donde el usuario más gastó en un periodo, ordenadas. Úsala para "¿en qué se me va más la plata?", "mis mayores gastos del mes".',
+    input_schema: {
+      type: 'object',
+      properties: {
+        desde: { type: 'string', description: 'Inicio del periodo en YYYY-MM-DD.' },
+        hasta: { type: 'string', description: 'Fin del periodo en YYYY-MM-DD.' },
+        limite: { type: 'integer', description: 'Top N categorías. Por defecto 5, máximo 20.' }
+      },
+      required: ['desde', 'hasta']
+    }
+  }
+];
+
+// Helpers de fecha y normalización
+function _parseFecha(s, fallback) {
+  if (!s) return fallback;
+  const d = new Date(s);
+  return isNaN(d.getTime()) ? fallback : d;
+}
+function _finDelDia(d) {
+  const x = new Date(d); x.setHours(23, 59, 59, 999); return x;
+}
+function _isoDia(d) {
+  return new Date(d).toISOString().substring(0, 10);
+}
+
+// Ejecuta la herramienta solicitada, siempre con scope al userId del usuario.
+async function ejecutarHerramientaEva(name, input, userId) {
+  try {
+    switch (name) {
+      case 'consultar_movimientos': {
+        const hasta = _finDelDia(_parseFecha(input.hasta, new Date()));
+        const desde = _parseFecha(input.desde, new Date(Date.now() - 30 * 24 * 60 * 60 * 1000));
+        const q = { userId, fecha: { $gte: desde, $lte: hasta } };
+        if (input.tipo) q.tipo = input.tipo;
+        if (input.categoria) q.categoria = input.categoria;
+        const limite = Math.min(input.limite || 20, 100);
+        const movs = await Movimiento.find(q).sort({ fecha: -1 }).limit(limite).lean();
+        const total = movs.reduce((s, m) => s + (m.monto || 0), 0);
+        return {
+          cantidad: movs.length,
+          totalSumado: total,
+          movimientos: movs.map(m => ({
+            fecha: _isoDia(m.fecha),
+            tipo: m.tipo,
+            categoria: m.categoria,
+            monto: m.monto,
+            descripcion: m.descripcion,
+            proveedor: m.proveedor || undefined,
+            metodoPago: m.metodoPago || undefined
+          }))
+        };
+      }
+      case 'consultar_facturas': {
+        const q = { userId };
+        if (input.estado) q.estado = input.estado;
+        if (input.cliente) q.clienteNombre = { $regex: input.cliente, $options: 'i' };
+        const limite = Math.min(input.limite || 20, 100);
+        const facts = await Factura.find(q).sort({ fecha: -1 }).limit(limite).lean();
+        return {
+          cantidad: facts.length,
+          totalSumado: facts.reduce((s, f) => s + (f.total || 0), 0),
+          facturas: facts.map(f => ({
+            numero: f.numero,
+            cliente: f.clienteNombre,
+            fecha: f.fecha ? _isoDia(f.fecha) : undefined,
+            estado: f.estado,
+            total: f.total
+          }))
+        };
+      }
+      case 'consultar_proveedor': {
+        if (!input.nombre?.trim()) return { error: 'El nombre es requerido' };
+        const provs = await Proveedor.find({
+          userId, nombre: { $regex: input.nombre.trim(), $options: 'i' }
+        }).limit(5).lean();
+        return {
+          encontrados: provs.length,
+          proveedores: provs.map(p => ({
+            nombre: p.nombre, nit: p.nit, telefono: p.telefono, email: p.email, ciudad: p.ciudad
+          }))
+        };
+      }
+      case 'consultar_cliente': {
+        if (!input.nombre?.trim()) return { error: 'El nombre es requerido' };
+        const cls = await Cliente.find({
+          userId, nombre: { $regex: input.nombre.trim(), $options: 'i' }
+        }).limit(5).lean();
+        return {
+          encontrados: cls.length,
+          clientes: cls.map(c => ({
+            nombre: c.nombre, nit: c.nit, telefono: c.telefono, email: c.email, ciudad: c.ciudad
+          }))
+        };
+      }
+      case 'resumen_periodo': {
+        const desde = _parseFecha(input.desde);
+        const hasta = _parseFecha(input.hasta);
+        if (!desde || !hasta) return { error: 'Fechas inválidas; usa formato YYYY-MM-DD' };
+        const hastaFin = _finDelDia(hasta);
+        const movs = await Movimiento.find({ userId, fecha: { $gte: desde, $lte: hastaFin } }).lean();
+        const ingresos = movs.filter(m => m.tipo === 'ingreso').reduce((s, m) => s + (m.monto || 0), 0);
+        const gastos = movs.filter(m => m.tipo === 'gasto').reduce((s, m) => s + (m.monto || 0), 0);
+        return {
+          desde: _isoDia(desde),
+          hasta: _isoDia(hasta),
+          ingresos, gastos, saldo: ingresos - gastos,
+          cantidadMovimientos: movs.length
+        };
+      }
+      case 'crear_movimiento': {
+        const { tipo, monto, categoria, descripcion, fecha, proveedor, metodoPago } = input;
+        if (!['ingreso', 'gasto'].includes(tipo)) return { error: 'tipo debe ser "ingreso" o "gasto"' };
+        if (!monto || monto <= 0) return { error: 'monto debe ser un número positivo' };
+        if (!categoria?.trim()) return { error: 'categoria es requerida' };
+        const mov = await new Movimiento({
+          descripcion: descripcion || categoria,
+          monto, tipo, categoria,
+          fecha: fecha ? new Date(fecha) : Date.now(),
+          userId,
+          proveedor: proveedor || '',
+          metodoPago: metodoPago || ''
+        }).save();
+        return { ok: true, id: mov._id.toString(), mensaje: `${tipo === 'ingreso' ? 'Ingreso' : 'Gasto'} de $${monto} en "${categoria}" registrado correctamente.` };
+      }
+      case 'crear_proveedor': {
+        if (!input.nombre?.trim()) return { error: 'nombre es requerido' };
+        const p = await new Proveedor({
+          userId,
+          nombre: input.nombre.trim(),
+          nit: input.nit || '',
+          telefono: input.telefono || '',
+          email: input.email || '',
+          direccion: input.direccion || ''
+        }).save();
+        return { ok: true, id: p._id.toString(), mensaje: `Proveedor "${p.nombre}" creado.` };
+      }
+      case 'marcar_factura': {
+        if (!['pendiente', 'pagada', 'anulada'].includes(input.estado)) return { error: 'estado inválido' };
+        let f = null;
+        if (mongoose.Types.ObjectId.isValid(input.numero)) {
+          f = await Factura.findOneAndUpdate({ _id: input.numero, userId }, { estado: input.estado }, { new: true });
+        }
+        if (!f) {
+          f = await Factura.findOneAndUpdate({ numero: input.numero, userId }, { estado: input.estado }, { new: true });
+        }
+        if (!f) return { error: `Factura "${input.numero}" no encontrada` };
+        return { ok: true, numero: f.numero, estado: f.estado, mensaje: `Factura ${f.numero} marcada como ${f.estado}.` };
+      }
+      case 'top_categorias_gasto': {
+        const desde = _parseFecha(input.desde);
+        const hasta = _parseFecha(input.hasta);
+        if (!desde || !hasta) return { error: 'Fechas inválidas; usa YYYY-MM-DD' };
+        const hastaFin = _finDelDia(hasta);
+        const limite = Math.min(input.limite || 5, 20);
+        const result = await Movimiento.aggregate([
+          { $match: {
+              userId: new mongoose.Types.ObjectId(userId),
+              tipo: 'gasto',
+              fecha: { $gte: desde, $lte: hastaFin }
+          } },
+          { $group: { _id: '$categoria', total: { $sum: '$monto' }, cantidad: { $sum: 1 } } },
+          { $sort: { total: -1 } },
+          { $limit: limite }
+        ]);
+        return {
+          desde: _isoDia(desde),
+          hasta: _isoDia(hasta),
+          categorias: result.map(r => ({ categoria: r._id, total: r.total, cantidad: r.cantidad }))
+        };
+      }
+      default:
+        return { error: 'Herramienta desconocida: ' + name };
+    }
+  } catch (e) {
+    console.error(`Tool "${name}" error:`, e?.message);
+    return { error: e?.message || 'Error al ejecutar la herramienta' };
+  }
+}
+
 app.post('/api/chat', verificarToken, async (req, res) => {
   try {
-    // 1. Tomamos el array de mensajes que envía el cliente
     const { messages } = req.body;
-
-    // 2. Validación básica: el array debe existir y tener al menos un mensaje
     if (!Array.isArray(messages) || messages.length === 0) {
       return res.status(400).json({ message: 'Se requiere un array de mensajes.' });
     }
 
-    // 3. Verificamos que la API key de Anthropic esté configurada en el .env
     const apiKey = process.env.ANTHROPIC_API_KEY;
     if (!apiKey || apiKey === 'TU_API_KEY_AQUI') {
       return res.status(503).json({ message: 'API key de Anthropic no configurada.' });
     }
-
-    // 4. Creamos el cliente de Anthropic con nuestra API key
     const client = new Anthropic({ apiKey });
 
-    // 5. Definimos el system prompt: aquí le damos personalidad e instrucciones a la IA
-    const systemPrompt = `Eres EVA, la asistente inteligente de la plataforma de gestión empresarial EVA.
-Tu misión es ayudar a pequeños y medianos empresarios colombianos a manejar mejor su negocio.
+    // ─── System prompt ESTÁTICO (cacheable con prompt caching) ────────────────
+    // Contiene el conocimiento concreto y permanente de la app EVA: rutas, pantallas,
+    // contabilidad colombiana, tono. Igual en cada llamada → Anthropic lo cachea y
+    // las siguientes peticiones pagan ~10% del costo de entrada por leerlo.
+    const SYSTEM_BASE = `Eres EVA, la asistente inteligente de la app "EVA Finanzas", una plataforma de gestión para pequeñas y medianas empresas colombianas. Hablas con el dueño del negocio. Tu trabajo es ayudarle a usar la app y a entender sus finanzas, contabilidad e impuestos en Colombia.
 
-Conoces a la perfección todas las funcionalidades de la plataforma EVA:
-- Facturas: crear, editar, marcar como pagadas o anuladas
-- Cotizaciones: crear y convertir en facturas con un clic
-- Remisiones: documentos de entrega de mercancía
-- Clientes: base de datos de clientes con NIT, teléfono, email
-- Proveedores: registro de proveedores con cuentas por pagar
-- Inventario: control de productos, precios de compra y venta, stock
-- Balance y situación financiera: activos, pasivos, flujo de caja
-- Análisis de facturas con IA: escanear facturas físicas automáticamente
+## CÓMO ESTÁ ORGANIZADA LA APP
 
-Cuando respondas:
-- Sé conciso y directo. Usa listas cuando sea útil.
-- Si el usuario pregunta cómo hacer algo en EVA, explícalo paso a paso.
-- Si pregunta sobre contabilidad o impuestos en Colombia, responde con precisión.
-- Nunca inventes datos. Si no sabes algo, dilo honestamente.
-- Responde siempre en español.`;
+La barra inferior tiene 4 pestañas:
+- **Inicio**: pantalla principal con accesos rápidos.
+- **Balance**: con dos sub-pestañas:
+  - "Caja Menor": ingresos y gastos del día seleccionado. Abajo hay dos botones: **+ Nuevo Ingreso** (verde) y **+ Nuevo Gasto** (rojo). El selector de día (LUN–DOM) está arriba.
+  - "Situación Financiera": activos, pasivos, obligaciones bancarias.
+- **Cuentas**: cuentas por cobrar y por pagar (facturas pendientes, deudas).
+- **Inventario**: productos. Incluye el botón **"Escanear factura con IA"** (la cámara extrae proveedor, productos y total de una foto).
 
-    // 6. Llamamos a la API de Anthropic con el modelo y los mensajes
-    const response = await client.messages.create({
-      model: 'claude-haiku-4-5-20251001',  // Haiku: rápido y económico, perfecto para chat
-      max_tokens: 1024,                     // Máximo de tokens en la respuesta
-      system: systemPrompt,                 // Personalidad e instrucciones de EVA
-      messages: messages,                   // El historial completo de la conversación
-    });
+El **menú lateral ☰** (esquina superior izquierda) da acceso a: Facturas, Cotizaciones, Remisiones, Clientes, Proveedores, Inventario, Balance, Estadísticas, Contactos, Centro de Ayuda, Configuración y Cerrar Sesión.
 
-    // 7. Extraemos el texto de la respuesta y lo enviamos al cliente
-    const reply = response.content[0].text;
-    res.json({ reply });
+Arriba a la derecha hay ⚙ (configuración) y 🔔 (notificaciones).
+
+## RUTAS PASO A PASO PARA LAS TAREAS MÁS COMUNES
+
+**Registrar un gasto:** Balance → "Caja Menor" → botón **+ Nuevo Gasto** → elige Tipo (Pagado / Deuda) → llena Fecha, Valor, Categoría (Servicios, Compras, Arriendo, Nómina, Mercadeo, etc.), Proveedor (puedes elegir uno existente o tocar **"Crear nuevo proveedor"** al final del desplegable), Método de pago, Descripción → **Registrar gasto**.
+
+**Registrar un ingreso:** Balance → **+ Nuevo Ingreso** → Fecha, Valor, Categoría (Venta de productos, Prestación de servicios, Factura cobrada, Anticipo, etc.), Proveedor / Fuente (lista real con opción de crear), Método de pago, Descripción → **Registrar ingreso**.
+
+**Crear una factura:** Menú ☰ → Facturas → **+ Nueva factura** → elige cliente (o crea uno nuevo desde ahí), agrega items (descripción, cantidad, precio), revisa IVA y total → guardar. La factura nace en estado "pendiente".
+
+**Marcar factura como pagada / anulada:** Facturas → abre la factura → cambia estado.
+
+**Convertir una cotización en factura:** Menú ☰ → Cotizaciones → abre la cotización → **"Convertir a factura"** → indica número de factura → queda creada automáticamente.
+
+**Crear cliente o proveedor:** Menú ☰ → Clientes / Proveedores → **+ Nuevo**. También puedes crear un proveedor sobre la marcha desde el desplegable "Proveedor" en Nuevo Gasto / Nuevo Ingreso.
+
+**Escanear una factura física con IA:** Inventario → **"Escanear factura"** → toma foto → la IA extrae proveedor, productos y total → confirmas y se crean el proveedor y los productos automáticamente.
+
+**Ver el resumen financiero:** Balance → "Situación Financiera" (activos, pasivos, obligaciones bancarias).
+
+**Estadísticas:** Menú ☰ → Estadísticas (gráficos de ingresos vs gastos, categorías, etc.).
+
+## CONTABILIDAD E IMPUESTOS EN COLOMBIA
+
+Eres precisa con: IVA (19% general, 5% para algunos bienes, exentos), retención en la fuente, régimen simple vs. ordinario, NIT y dígito de verificación, RUT, facturación electrónica DIAN, ICA municipal, ReteIVA, ReteICA, declaración de renta, libros contables. Cuando una cifra dependa del año fiscal o de la actividad económica, dilo y sugiere consultar a un contador.
+
+## TONO Y ESTILO
+
+- Respondes SIEMPRE en español, cercano y respetuoso (sin tutear a las patadas, sin "amigo/parce" excesivo).
+- Vas al grano. Usa **negrita** para los pasos clave, listas numeradas para procesos, viñetas para opciones.
+- Cuando expliques "cómo hacer X en EVA", da la ruta exacta (las de arriba). NO digas "no tengo claridad sobre tu versión" ni "revisa el menú": tienes claro lo de arriba.
+- Si te preguntan algo que claramente no existe en EVA, dilo con honestidad y sugiere la alternativa más cercana.
+- Nunca inventes datos del usuario. Si los necesitas, mira la sección "Datos en vivo" más abajo o pídelos.
+- Usa el nombre del usuario cuando esté disponible.
+- Cifras en pesos colombianos con separador de miles (ej. $ 1.250.000).`;
+
+    // ─── Contexto EN VIVO del usuario (no se cachea — cambia por usuario) ─────
+    // Le permite a EVA responder "¿cuál es mi saldo?", "¿cuántas facturas tengo
+    // pendientes?", "¿quién me debe más?", con números reales.
+    let contextoVivo = '';
+    try {
+      const userId = req.user.id;
+      const [user, movs, facturasPend, clientesN, proveedoresN, inventarioN] = await Promise.all([
+        User.findById(userId).select('nombre username').lean(),
+        Movimiento.find({ userId }).sort({ fecha: -1 }).limit(50).lean(),
+        Factura.find({ userId, estado: 'pendiente' }).select('total clienteNombre numero').lean(),
+        Cliente.countDocuments({ userId }),
+        Proveedor.countDocuments({ userId }),
+        Inventario.countDocuments({ userId })
+      ]);
+
+      const ingresos = movs.filter(m => m.tipo === 'ingreso').reduce((s, m) => s + (m.monto || 0), 0);
+      const gastos   = movs.filter(m => m.tipo === 'gasto').reduce((s, m) => s + (m.monto || 0), 0);
+      const saldo    = ingresos - gastos;
+      const totalPendiente = facturasPend.reduce((s, f) => s + (f.total || 0), 0);
+
+      const fmt = n => '$ ' + Math.round(n || 0).toString().replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+      const ultimos = movs.slice(0, 5).map(m => {
+        const signo = m.tipo === 'ingreso' ? '+' : '-';
+        const fecha = new Date(m.fecha).toLocaleDateString('es-CO');
+        const desc  = m.descripcion ? ' · ' + m.descripcion : '';
+        return `  - ${signo}${fmt(m.monto)} · ${m.categoria}${desc} (${fecha})`;
+      }).join('\n') || '  (aún sin movimientos registrados)';
+
+      const nombre = user?.nombre?.trim() || user?.username || 'usuario';
+
+      contextoVivo = `## DATOS EN VIVO DEL USUARIO (úsalos para responder con cifras REALES)
+
+Usuario: ${nombre}
+Saldo (últimos 50 movimientos): ${fmt(saldo)}  (ingresos ${fmt(ingresos)} − gastos ${fmt(gastos)})
+Facturas pendientes: ${facturasPend.length}  ·  total por cobrar: ${fmt(totalPendiente)}
+Clientes registrados: ${clientesN}  ·  Proveedores: ${proveedoresN}  ·  Productos en inventario: ${inventarioN}
+
+Últimos movimientos:
+${ultimos}
+
+Reglas:
+- Si te preguntan por saldo, facturas pendientes, cuántos clientes/proveedores tiene, sus últimos movimientos, etc., RESPONDE con estos números.
+- Si te piden detalle que no aparece aquí (un cliente específico, una factura puntual, un producto), dile a qué pantalla ir a consultarlo.
+- Si todo está en cero, díselo con tacto y sugiere qué registrar primero para empezar.`;
+    } catch (e) {
+      console.error('chat: error armando contexto en vivo:', e?.message);
+      // Si falla la carga de contexto, igual respondemos (sin datos en vivo).
+    }
+
+    // ── Loop de ejecución de herramientas ─────────────────────────────────────
+    // El modelo puede pedir invocar una o varias herramientas (consultar datos,
+    // crear movimientos, etc.). Las corremos, devolvemos el resultado y
+    // repetimos hasta que el modelo dé la respuesta final (stop_reason !== 'tool_use').
+    let currentMessages = messages;
+    let finalText = '';
+    const MAX_ITER = 5;  // tope de seguridad: nunca más de 5 vueltas por mensaje
+
+    for (let iter = 0; iter < MAX_ITER; iter++) {
+      const response = await client.messages.create({
+        model: 'claude-haiku-4-5-20251001',  // Haiku: rápido y barato; suficiente para esta etapa
+        max_tokens: 2048,
+        system: [
+          // Parte estática (prompt + persona + rutas) → cacheada 5 min.
+          { type: 'text', text: SYSTEM_BASE, cache_control: { type: 'ephemeral' } },
+          // Parte dinámica (cifras del usuario) → no se cachea.
+          ...(contextoVivo ? [{ type: 'text', text: contextoVivo }] : [])
+        ],
+        tools: EVA_TOOLS,
+        messages: currentMessages,
+      });
+
+      // Acumula el texto que EVA quiso decir antes/después de invocar tools.
+      const textBlocks = response.content.filter(b => b.type === 'text');
+      if (textBlocks.length) {
+        const t = textBlocks.map(b => b.text).join('\n').trim();
+        if (t) finalText += (finalText ? '\n\n' : '') + t;
+      }
+
+      if (response.stop_reason !== 'tool_use') break;
+
+      // El modelo pidió ejecutar una o varias herramientas
+      const toolUses = response.content.filter(b => b.type === 'tool_use');
+      const toolResults = await Promise.all(toolUses.map(async tu => ({
+        type: 'tool_result',
+        tool_use_id: tu.id,
+        content: JSON.stringify(await ejecutarHerramientaEva(tu.name, tu.input, req.user.id))
+      })));
+
+      currentMessages = [
+        ...currentMessages,
+        { role: 'assistant', content: response.content },
+        { role: 'user', content: toolResults }
+      ];
+    }
+
+    res.json({ reply: finalText || 'Sin respuesta.' });
 
   } catch (err) {
-    // 8. Manejo de errores específicos de la API de Anthropic
     console.error('Error en chat EVA:', err);
     const msg = err?.error?.error?.message || err?.message || 'Error desconocido';
     if (err.status === 401) return res.status(401).json({ message: 'API key de Anthropic inválida.' });
