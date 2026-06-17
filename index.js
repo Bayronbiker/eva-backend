@@ -178,6 +178,12 @@ app.post('/api/login', async (req, res) => {
         process.env.JWT_SECRET,
         { expiresIn: '15m' }
       );
+      // Si ya hay email guardado, dispara el envío del código en background. El rate-limit
+      // interno de crearYEnviarCodigo (60s) evita spam si el usuario hace login varias veces.
+      if (usuario.email) {
+        crearYEnviarCodigo(usuario, usuario.email).catch(e =>
+          console.error('[login] envío código en pendingVerification falló:', e.message));
+      }
       return res.status(200).json({
         message: "Verificación pendiente",
         pendingVerification: true,
