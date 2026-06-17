@@ -6,6 +6,8 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 
 const User = require('./models/User');
+const EmailVerification = require('./models/EmailVerification');
+const { sendVerificationCode } = require('./services/email');
 const Movimiento = require('./models/Movimiento');
 const Factura = require('./models/Factura');
 const Remision = require('./models/Remision');
@@ -46,7 +48,9 @@ mongoose.connect(process.env.MONGO_URI, { serverSelectionTimeoutMS: 5000 })
   .then(() => console.log("✅ Conexión establecida con MongoDB Atlas"))
   .catch(err => console.error("❌ ERROR:", err.message));
 
-const verificarToken = (req, res, next) => {
+// Middleware "laxo": valida JWT pero NO exige email verificado.
+// Lo usan los endpoints de /api/auth/email/* (porque el usuario aún no ha verificado).
+const verificarTokenSinVerificacion = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   if (!authHeader) return res.status(401).json({ message: "No se proporcionó token." });
   const token = authHeader.startsWith('Bearer ') ? authHeader.split(' ')[1] : authHeader;
@@ -58,16 +62,103 @@ const verificarToken = (req, res, next) => {
   }
 };
 
+// Middleware "estricto": valida JWT + consulta el User y exige emailVerified=true.
+// Si no está verificado responde 403 con { code: 'EMAIL_NOT_VERIFIED' } para que el
+// cliente sepa redirigir a la pantalla de verificación.
+const verificarToken = async (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  if (!authHeader) return res.status(401).json({ message: "No se proporcionó token." });
+  const token = authHeader.startsWith('Bearer ') ? authHeader.split(' ')[1] : authHeader;
+  try {
+    req.user = jwt.verify(token, process.env.JWT_SECRET);
+  } catch (e) {
+    return res.status(403).json({ message: "Sesión expirada o token inválido." });
+  }
+  try {
+    const usuario = await User.findById(req.user.id).select('emailVerified email');
+    if (!usuario) return res.status(403).json({ message: "Usuario no encontrado" });
+    if (!usuario.emailVerified) {
+      return res.status(403).json({
+        code: 'EMAIL_NOT_VERIFIED',
+        message: 'Debes verificar tu correo electrónico para continuar.',
+        email: usuario.email || null
+      });
+    }
+    next();
+  } catch (err) {
+    res.status(500).json({ message: "Error verificando sesión" });
+  }
+};
+
+// Helper: genera un código de 6 dígitos (incluye ceros a la izquierda).
+function generarCodigo6() {
+  return String(Math.floor(Math.random() * 1000000)).padStart(6, '0');
+}
+
+// Helper: crea un nuevo registro de verificación, eliminando los anteriores del mismo usuario.
+// Aplica un rate-limit suave: no permite reenvíos en menos de 60 segundos.
+async function crearYEnviarCodigo(usuario, emailDestino) {
+  const ultimo = await EmailVerification.findOne({ userId: usuario._id }).sort({ createdAt: -1 });
+  if (ultimo) {
+    const segs = (Date.now() - ultimo.createdAt.getTime()) / 1000;
+    if (segs < 60) {
+      const err = new Error(`Espera ${Math.ceil(60 - segs)} segundos antes de solicitar otro código.`);
+      err.code = 'RATE_LIMIT';
+      err.retryAfter = Math.ceil(60 - segs);
+      throw err;
+    }
+  }
+  await EmailVerification.deleteMany({ userId: usuario._id });
+  const codigo = generarCodigo6();
+  await new EmailVerification({ userId: usuario._id, email: emailDestino, code: codigo }).save();
+  await sendVerificationCode(emailDestino, codigo, usuario.nombre);
+  return codigo;
+}
+
 // AUTH
 app.post('/api/register', async (req, res) => {
   try {
     const { username, password, nombre, email, telefono } = req.body;
     if (!username || !password) return res.status(400).json({ message: "Usuario y contraseña son obligatorios" });
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ message: "Debes ingresar un correo electrónico válido" });
+    }
+    const emailNorm = email.trim().toLowerCase();
     if (await User.findOne({ username })) return res.status(400).json({ message: "El usuario ya existe" });
+    if (await User.findOne({ email: emailNorm })) return res.status(400).json({ message: "Ese correo ya está registrado" });
     const passwordHashed = await bcrypt.hash(password, await bcrypt.genSalt(10));
-    await new User({ username, password: passwordHashed, nombre: nombre || '', email: email || '', telefono: telefono || '' }).save();
-    res.status(201).json({ message: "Registro exitoso" });
-  } catch (err) { res.status(500).json({ message: "Error en registro" }); }
+    const nuevoUsuario = await new User({
+      username,
+      password: passwordHashed,
+      nombre: nombre || '',
+      email: emailNorm,
+      telefono: telefono || '',
+      emailVerified: false
+    }).save();
+
+    // Token "pendiente": 15 min, marcado con purpose='email-verify'. Solo sirve para los
+    // endpoints /api/auth/email/*; cualquier ruta de datos lo rechaza con EMAIL_NOT_VERIFIED.
+    const pendingToken = jwt.sign(
+      { id: nuevoUsuario._id, username: nuevoUsuario.username, purpose: 'email-verify' },
+      process.env.JWT_SECRET,
+      { expiresIn: '15m' }
+    );
+
+    // Disparo del correo en fire-and-forget: si falla, el usuario puede reenviarlo desde
+    // la pantalla de verificación con el botón "Reenviar".
+    crearYEnviarCodigo(nuevoUsuario, emailNorm).catch(e => console.error('[register] envío código falló:', e.message));
+
+    res.status(201).json({
+      message: "Registro exitoso. Te enviamos un código de verificación.",
+      pendingToken,
+      userId: nuevoUsuario._id,
+      email: emailNorm,
+      emailVerified: false
+    });
+  } catch (err) {
+    console.error('[register]', err);
+    res.status(500).json({ message: "Error en registro" });
+  }
 });
 
 app.post('/api/login', async (req, res) => {
@@ -77,12 +168,120 @@ app.post('/api/login', async (req, res) => {
     const usuario = await User.findOne({ username });
     if (!usuario) return res.status(400).json({ message: "Usuario no encontrado" });
     if (!await bcrypt.compare(password, usuario.password)) return res.status(400).json({ message: "Contraseña incorrecta" });
-    // Token de larga duración (30 días): evita que la sesión expire mientras la app
-    // está en segundo plano. Antes ('24h') el token caducaba de un día para otro y
-    // cualquier guardado posterior fallaba con 403 hasta volver a iniciar sesión.
+
+    // Si el correo NO está verificado, devolvemos pendingToken y datos mínimos para que el
+    // cliente navegue a la pantalla de verificación. Cubre dos casos: (a) usuario que se
+    // registró pero no completó la verificación; (b) usuario antiguo sin email/sin verificar.
+    if (!usuario.emailVerified) {
+      const pendingToken = jwt.sign(
+        { id: usuario._id, username: usuario.username, purpose: 'email-verify' },
+        process.env.JWT_SECRET,
+        { expiresIn: '15m' }
+      );
+      return res.status(200).json({
+        message: "Verificación pendiente",
+        pendingVerification: true,
+        pendingToken,
+        userId: usuario._id,
+        username: usuario.username,
+        email: usuario.email || null,
+        needsEmail: !usuario.email   // true → el cliente debe pedirle el email primero
+      });
+    }
+
+    // Token completo (30 días) — solo cuando emailVerified=true.
     const token = jwt.sign({ id: usuario._id, username: usuario.username, role: usuario.role }, process.env.JWT_SECRET, { expiresIn: '30d' });
     res.json({ message: "Login exitoso", token, user: { id: usuario._id, username: usuario.username, role: usuario.role || 'user', nombre: usuario.nombre, email: usuario.email } });
-  } catch (err) { res.status(500).json({ message: "Error en login" }); }
+  } catch (err) {
+    console.error('[login]', err);
+    res.status(500).json({ message: "Error en login" });
+  }
+});
+
+// ─── EMAIL VERIFICATION ─────────────────────────────────────────────────────────
+// Endpoints autenticados con `verificarTokenSinVerificacion` porque por definición
+// el usuario aún no tiene emailVerified=true cuando los llama.
+
+// POST /api/auth/email/send-code
+// Body opcional: { email } — solo necesario si el usuario aún no tiene email guardado
+// (caso de usuarios antiguos). Si lo manda, se guarda en el User antes de enviar el código.
+app.post('/api/auth/email/send-code', verificarTokenSinVerificacion, async (req, res) => {
+  try {
+    const usuario = await User.findById(req.user.id);
+    if (!usuario) return res.status(404).json({ message: "Usuario no encontrado" });
+    if (usuario.emailVerified) return res.status(400).json({ message: "Tu correo ya está verificado" });
+
+    let emailDestino = usuario.email;
+    if (req.body && req.body.email) {
+      const e = String(req.body.email).trim().toLowerCase();
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)) {
+        return res.status(400).json({ message: "Correo electrónico inválido" });
+      }
+      // No permitir reusar un email ya verificado por otra cuenta
+      const conflicto = await User.findOne({ email: e, _id: { $ne: usuario._id } });
+      if (conflicto) return res.status(400).json({ message: "Ese correo ya está registrado por otra cuenta" });
+      usuario.email = e;
+      await usuario.save();
+      emailDestino = e;
+    }
+    if (!emailDestino) {
+      return res.status(400).json({ message: "Debes proporcionar un correo electrónico" });
+    }
+    await crearYEnviarCodigo(usuario, emailDestino);
+    res.json({ message: "Código enviado", email: emailDestino });
+  } catch (err) {
+    if (err.code === 'RATE_LIMIT') {
+      return res.status(429).json({ message: err.message, retryAfter: err.retryAfter });
+    }
+    console.error('[send-code]', err);
+    res.status(500).json({ message: "No se pudo enviar el código. Intenta de nuevo." });
+  }
+});
+
+// POST /api/auth/email/verify-code
+// Body: { code }
+app.post('/api/auth/email/verify-code', verificarTokenSinVerificacion, async (req, res) => {
+  try {
+    const { code } = req.body || {};
+    if (!code || !/^\d{6}$/.test(String(code))) {
+      return res.status(400).json({ message: "Código inválido" });
+    }
+    const ev = await EmailVerification.findOne({ userId: req.user.id });
+    if (!ev) return res.status(400).json({ message: "El código expiró. Solicita uno nuevo." });
+    if (ev.attempts >= 5) {
+      await EmailVerification.deleteMany({ userId: req.user.id });
+      return res.status(429).json({ message: "Demasiados intentos. Solicita un código nuevo." });
+    }
+    if (ev.code !== String(code)) {
+      ev.attempts += 1;
+      await ev.save();
+      const restantes = Math.max(0, 5 - ev.attempts);
+      return res.status(400).json({ message: `Código incorrecto. Intentos restantes: ${restantes}` });
+    }
+
+    // Éxito: marcar usuario verificado, limpiar registros de verificación, emitir token completo.
+    const usuario = await User.findById(req.user.id);
+    if (!usuario) return res.status(404).json({ message: "Usuario no encontrado" });
+    usuario.emailVerified = true;
+    usuario.emailVerifiedAt = new Date();
+    if (ev.email && usuario.email !== ev.email) usuario.email = ev.email;
+    await usuario.save();
+    await EmailVerification.deleteMany({ userId: usuario._id });
+
+    const token = jwt.sign(
+      { id: usuario._id, username: usuario.username, role: usuario.role },
+      process.env.JWT_SECRET,
+      { expiresIn: '30d' }
+    );
+    res.json({
+      message: "Correo verificado correctamente",
+      token,
+      user: { id: usuario._id, username: usuario.username, role: usuario.role || 'user', nombre: usuario.nombre, email: usuario.email }
+    });
+  } catch (err) {
+    console.error('[verify-code]', err);
+    res.status(500).json({ message: "Error verificando código" });
+  }
 });
 
 app.get('/api/user/profile', verificarToken, async (req, res) => {
