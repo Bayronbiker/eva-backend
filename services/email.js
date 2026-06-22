@@ -89,4 +89,54 @@ async function sendVerificationCode(to, code, nombre) {
     });
 }
 
-module.exports = { sendEmail, sendVerificationCode };
+function buildPasswordResetHtml(code, nombre) {
+    const saludo = nombre ? `Hola ${escapeHtml(nombre)},` : 'Hola,';
+    return `
+<!DOCTYPE html>
+<html lang="es">
+<head><meta charset="UTF-8"></head>
+<body style="margin:0;padding:0;background:#F5F7F5;font-family:Arial,Helvetica,sans-serif;">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#F5F7F5;padding:32px 16px;">
+    <tr><td align="center">
+      <table role="presentation" width="100%" style="max-width:520px;background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 4px 16px rgba(0,0,0,0.06);">
+        <tr><td style="background:#1B5E20;padding:28px 32px;">
+          <h1 style="margin:0;color:#ffffff;font-size:24px;font-weight:800;letter-spacing:-0.3px;">Eva Finanzas</h1>
+          <p style="margin:6px 0 0;color:#C8E6C9;font-size:13px;">Restablecer contraseña</p>
+        </td></tr>
+        <tr><td style="padding:32px;color:#1a1a1a;">
+          <p style="margin:0 0 16px;font-size:15px;">${saludo}</p>
+          <p style="margin:0 0 24px;font-size:15px;line-height:1.55;">
+            Recibimos una solicitud para restablecer tu contraseña en Eva. Usa el siguiente
+            código para crear una nueva. El código expira en <strong>15 minutos</strong>.
+          </p>
+          <div style="text-align:center;margin:28px 0;">
+            <div style="display:inline-block;background:#FFF3E0;border:2px solid #E65100;border-radius:14px;padding:18px 28px;">
+              <span style="font-family:'Courier New',monospace;font-size:34px;font-weight:800;letter-spacing:8px;color:#E65100;">${code}</span>
+            </div>
+          </div>
+          <p style="margin:24px 0 0;font-size:13px;color:#757575;line-height:1.5;">
+            <strong>Si no solicitaste restablecer tu contraseña, ignora este correo.</strong>
+            Tu cuenta sigue protegida — nadie puede cambiar la contraseña sin este código.
+          </p>
+        </td></tr>
+        <tr><td style="background:#FAFAFA;padding:18px 32px;border-top:1px solid #EEEEEE;">
+          <p style="margin:0;font-size:12px;color:#9e9e9e;text-align:center;">
+            Este correo fue enviado por Eva Finanzas. No respondas a esta dirección.
+          </p>
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`.trim();
+}
+
+async function sendPasswordResetCode(to, code, nombre) {
+    return sendEmail({
+        to,
+        subject: `Tu código para restablecer la contraseña: ${code}`,
+        html: buildPasswordResetHtml(code, nombre),
+    });
+}
+
+module.exports = { sendEmail, sendVerificationCode, sendPasswordResetCode };

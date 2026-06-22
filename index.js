@@ -7,7 +7,8 @@ const jwt = require('jsonwebtoken');
 
 const User = require('./models/User');
 const EmailVerification = require('./models/EmailVerification');
-const { sendVerificationCode } = require('./services/email');
+const PasswordReset = require('./models/PasswordReset');
+const { sendVerificationCode, sendPasswordResetCode } = require('./services/email');
 const Movimiento = require('./models/Movimiento');
 const Factura = require('./models/Factura');
 const Remision = require('./models/Remision');
@@ -287,6 +288,138 @@ app.post('/api/auth/email/verify-code', verificarTokenSinVerificacion, async (re
   } catch (err) {
     console.error('[verify-code]', err);
     res.status(500).json({ message: "Error verificando código" });
+  }
+});
+
+// ─── PASSWORD RESET ─────────────────────────────────────────────────────────────
+// Sin autenticación: el usuario está bloqueado fuera. Identificación por username
+// o email para soportar usuarios antiguos cuyo username ya es su correo.
+
+// POST /api/auth/password/forgot
+// Body: { identifier }  ← username o email del usuario
+// Siempre responde 200 con el mismo mensaje (sin importar si el usuario existe o no)
+// para evitar enumeración de cuentas. Solo envía el correo si efectivamente existe
+// el usuario Y tiene un email guardado a donde mandar el código.
+app.post('/api/auth/password/forgot', async (req, res) => {
+  const respuestaGenerica = {
+    message: "Si la cuenta existe y tiene un correo asociado, te enviaremos un código."
+  };
+  try {
+    const { identifier } = req.body || {};
+    if (!identifier || typeof identifier !== 'string') {
+      return res.status(200).json(respuestaGenerica);
+    }
+    const input = identifier.trim();
+    const usuario = await User.findOne({
+      $or: [{ username: input }, { email: input.toLowerCase() }]
+    });
+    // Si no existe o no tiene email, devolvemos la misma respuesta genérica.
+    if (!usuario || !usuario.email) {
+      return res.status(200).json(respuestaGenerica);
+    }
+
+    // Rate-limit suave: si ya hay un código activo creado hace <60s, no enviamos otro.
+    const ultimo = await PasswordReset.findOne({ userId: usuario._id }).sort({ createdAt: -1 });
+    if (ultimo) {
+      const segs = (Date.now() - ultimo.createdAt.getTime()) / 1000;
+      if (segs < 60) {
+        return res.status(200).json(respuestaGenerica);   // silencioso para no revelar nada
+      }
+    }
+    await PasswordReset.deleteMany({ userId: usuario._id });
+    const codigo = generarCodigo6();
+    await new PasswordReset({ userId: usuario._id, email: usuario.email, code: codigo }).save();
+    sendPasswordResetCode(usuario.email, codigo, usuario.nombre)
+      .catch(e => console.error('[forgot-password] envío falló:', e.message));
+
+    return res.status(200).json(respuestaGenerica);
+  } catch (err) {
+    console.error('[forgot-password]', err);
+    // Aún en error interno devolvemos el mensaje genérico para no filtrar nada.
+    return res.status(200).json(respuestaGenerica);
+  }
+});
+
+// POST /api/auth/password/reset
+// Body: { identifier, code, newPassword }
+// Valida el código, actualiza la contraseña (hasheada), elimina los códigos del usuario
+// y devuelve un token de sesión completo para que el usuario quede logueado.
+app.post('/api/auth/password/reset', async (req, res) => {
+  try {
+    const { identifier, code, newPassword } = req.body || {};
+    if (!identifier || !code || !newPassword) {
+      return res.status(400).json({ message: "Faltan datos: identifier, code y newPassword son obligatorios." });
+    }
+    if (typeof newPassword !== 'string' || newPassword.length < 7) {
+      return res.status(400).json({ message: "La nueva contraseña debe tener al menos 7 caracteres." });
+    }
+    if (!/^\d{6}$/.test(String(code))) {
+      return res.status(400).json({ message: "Código inválido" });
+    }
+
+    const input = String(identifier).trim();
+    const usuario = await User.findOne({
+      $or: [{ username: input }, { email: input.toLowerCase() }]
+    });
+    if (!usuario) {
+      return res.status(400).json({ message: "Código inválido o expirado" });
+    }
+    const pr = await PasswordReset.findOne({ userId: usuario._id });
+    if (!pr) {
+      return res.status(400).json({ message: "El código expiró. Solicita uno nuevo." });
+    }
+    if (pr.attempts >= 5) {
+      await PasswordReset.deleteMany({ userId: usuario._id });
+      return res.status(429).json({ message: "Demasiados intentos. Solicita un código nuevo." });
+    }
+    if (pr.code !== String(code)) {
+      pr.attempts += 1;
+      await pr.save();
+      const restantes = Math.max(0, 5 - pr.attempts);
+      return res.status(400).json({ message: `Código incorrecto. Intentos restantes: ${restantes}` });
+    }
+
+    // Éxito: actualizar contraseña + limpiar códigos + emitir token de sesión.
+    usuario.password = await bcrypt.hash(newPassword, await bcrypt.genSalt(10));
+    // Si al resetear queremos también marcar el email como verificado (recibió el código,
+    // luego el correo es válido y accesible), descomenta las dos líneas siguientes.
+    // Por ahora respetamos el estado anterior para no mezclar flujos.
+    // if (!usuario.emailVerified) { usuario.emailVerified = true; usuario.emailVerifiedAt = new Date(); }
+    await usuario.save();
+    await PasswordReset.deleteMany({ userId: usuario._id });
+
+    // Solo emitimos token completo si el correo ya estaba verificado. Si no, devolvemos
+    // pendingToken para que pase por el flujo de verificación (consistente con login).
+    if (usuario.emailVerified) {
+      const token = jwt.sign(
+        { id: usuario._id, username: usuario.username, role: usuario.role },
+        process.env.JWT_SECRET,
+        { expiresIn: '30d' }
+      );
+      return res.json({
+        message: "Contraseña actualizada",
+        token,
+        user: { id: usuario._id, username: usuario.username, role: usuario.role || 'user', nombre: usuario.nombre, email: usuario.email }
+      });
+    } else {
+      const pendingToken = jwt.sign(
+        { id: usuario._id, username: usuario.username, purpose: 'email-verify' },
+        process.env.JWT_SECRET,
+        { expiresIn: '15m' }
+      );
+      return res.json({
+        message: "Contraseña actualizada. Verifica tu correo para continuar.",
+        pendingVerification: true,
+        pendingToken,
+        userId: usuario._id,
+        username: usuario.username,
+        email: usuario.email,
+        needsEmail: false
+      });
+    }
+  } catch (err) {
+    console.error('[reset-password]', err);
+    res.status(500).json({ message: "Error restableciendo contraseña" });
   }
 });
 
